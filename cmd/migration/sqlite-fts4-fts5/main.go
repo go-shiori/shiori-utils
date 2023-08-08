@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
@@ -71,6 +72,45 @@ func migrateBookmarkContentsFTS4toFTS5(db *sqlx.DB) error {
 	return nil
 }
 
+func cleanSchemaMigrations(db *sqlx.DB) error {
+	row := db.QueryRow(`SELECT version, dirty FROM schema_migrations`)
+	tableExists := row.Err() == nil || (row.Err() != nil && !strings.Contains(row.Err().Error(), "no such table"))
+	if row.Err() != nil && tableExists {
+		return fmt.Errorf("error during query to check schema_migrations table: %s", row.Err())
+	}
+
+	if !tableExists {
+		log.Info().Msg("schema_migrations table not found. Skipping.")
+		return nil
+	}
+
+	var version, dirty int
+	if err := row.Scan(&version, &dirty); err != nil {
+		return fmt.Errorf("error extracting information from schema_migrations table")
+	}
+
+	if dirty != 1 {
+		log.Info().Msg("schema_migrations table is not dirty. Skipping.")
+		return nil
+	}
+
+	tx, err := db.Beginx()
+	if err != nil {
+		return err
+	}
+
+	log.Info().Msg("Updating schema_migrations table to reflect the migration")
+	tx.MustExec(`UPDATE schema_migrations SET version = ?, dirty = 0`, version-1)
+
+	// Commit
+	log.Debug().Msg("Committing")
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("error restoring schema_migrations to usable state: %s", err)
+	}
+
+	return nil
+}
+
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
@@ -87,7 +127,7 @@ func main() {
 	log.Warn().Msg("Remember to make a backup of your database file!")
 	log.Warn().Msg("Press any key when you are ready to proceed.")
 
-	os.Stdin.Read(make([]byte, 1))
+	_, _ = os.Stdin.Read(make([]byte, 1))
 
 	db, err := open(*databasePath)
 	if err != nil {
@@ -95,6 +135,10 @@ func main() {
 	}
 
 	if err := migrateBookmarkContentsFTS4toFTS5(db); err != nil {
-		log.Error().Msgf("error migrating database: %s", err)
+		log.Error().Msgf("error migrating database to fts5: %s", err)
+	}
+
+	if err := cleanSchemaMigrations(db); err != nil {
+		log.Error().Msgf("error modifying schema_migrations: %s", err)
 	}
 }
